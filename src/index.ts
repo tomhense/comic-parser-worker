@@ -1,7 +1,6 @@
-//import { eventTargetToAsyncIter } from './event-target-to-async-iter';
-import { eventTargetToAsyncIter } from 'event-target-to-async-iter';
-
-declare const HTMLRewriter: any;
+import { Feed, Item } from 'feed';
+import { TheJenkinsComic } from './parser/thejenkinscomic';
+import { base64Decode } from 'miniflare';
 
 /**
  * Welcome to Cloudflare Workers! This is your first worker.
@@ -13,62 +12,105 @@ declare const HTMLRewriter: any;
  * Learn more at https://developers.cloudflare.com/workers/
  */
 
-export default {
-	async fetch(request, env, ctx) {
-		// Polyfill for CustomEvent
-		if (!('CustomEvent' in self)) {
-			class CustomEvent<T = any> extends Event {
-				readonly detail: T;
-				constructor(event: string, { detail }: CustomEventInit<T>) {
-					super(event);
-					this.detail = detail as T;
-				}
-			}
+const parsers = {
+	thejenkinscomic: TheJenkinsComic,
+};
 
-			Object.defineProperty(self, 'CustomEvent', {
-				configurable: false,
-				enumerable: false,
-				writable: false,
-				value: CustomEvent,
+function generateFeedResponse(comics: Item[]) {
+	const feed = new Feed(TheJenkinsComic.rssOptions);
+
+	comics.forEach((comic) => {
+		feed.addItem(comic);
+	});
+
+	return new Response(feed.atom1(), {
+		headers: {
+			'Content-Type': 'application/atom+xml',
+			'Cache-Control': 'max-age=900',
+		},
+	});
+}
+
+async function generateImagePage(comicName: string, id: string, KV: any) {
+	const comic = JSON.parse(await KV.get(comicName + '_' + id));
+
+	if (!comic) {
+		return new Response('Not found', {
+			status: 404,
+		});
+	}
+
+	const html = `<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8" />
+		<title>${comic.title}</title>
+	</head>
+	<body>
+		<h1>${comic.title}</h1>
+		<span><time datetime="${comic.date}"></span>
+		<img src="${comic.link}" />
+		<span>${comic.description}</span>
+	</body>
+</html>
+`;
+
+	return new Response(html, {
+		headers: {
+			'Content-Type': 'text/html',
+			'Cache-Control': 'max-age=3600',
+		},
+	});
+}
+
+export default {
+	async fetch(request, env) {
+		const requestUrl = new URL(request.url);
+		const cache = await caches.open('comics');
+		const cacheResponse = await cache.match(requestUrl);
+
+		const urlSegments = new URL(request.url).pathname.split('/').slice(1);
+		const urlRootSegment = urlSegments[0].toLowerCase();
+
+		// If the param is not a valid parser, return 404
+		if (!urlRootSegment || !parsers.hasOwnProperty(urlRootSegment)) {
+			return new Response('Not found', {
+				status: 404,
 			});
 		}
 
-		async function consume(stream: ReadableStream) {
-			const reader = stream.getReader();
-			while (!(await reader.read()).done) {
-				/* NOOP */
-			}
-		}
+		if (cacheResponse) {
+			// Cache hit
+			return cacheResponse;
+		} else {
+			// Cache miss
 
-		const response = await fetch('https://thejenkinscomic.wordpress.com');
+			if (urlSegments.length == 1) {
+				const comics = await parsers[urlRootSegment].get();
+				const comicName: string = parsers[urlRootSegment].comicName;
 
-		const target = new EventTarget();
+				// Cache the comics
+				for (const comic of comics) {
+					const comicKey = comicName + '_' + comic.id;
+					await env.COMIC_KV.put(comicKey, JSON.stringify(comic));
+				}
 
-		const rewriter = new HTMLRewriter().on('article .wp-block-image img', {
-			element(el) {
-				target.dispatchEvent(
-					new CustomEvent('data', {
-						detail: el.getAttribute('src'),
+				return generateFeedResponse(
+					// Overwrite the links to point to the worker
+					comics.map((comic: Item) => {
+						comic.link = `/${comicName}/${comic.id}`;
+						return comic;
 					})
 				);
-			},
-		});
-
-		const data = eventTargetToAsyncIter(target, 'data');
-
-		consume(rewriter.transform(response).body!)
-			.catch((e) => data.throw(e))
-			.then(() => data.return());
-
-		const sources: string[] = [];
-		for await (const i of data) {
-			sources.push((i as CustomEvent<string>).detail);
+			} else if (urlSegments.length == 2) {
+				// Special generate html pages for the comic images
+				return generateImagePage(urlRootSegment, urlSegments[1], env.COMIC_KV);
+			} else {
+				// Return 404 for anything else
+				return new Response('Not found', {
+					status: 404,
+				});
+			}
 		}
-
-		return new Response(JSON.stringify(sources), {
-			headers: {
-				'content-type': 'application/json;charset=UTF-8',
-			},
-		});
 	},
 };
