@@ -54,8 +54,7 @@ export class TheJenkinsComic {
 					title: title,
 					id: id,
 					link: src,
-					description: title,
-					content: title,
+					image: src,
 					date: new Date(date),
 				});
 			}
